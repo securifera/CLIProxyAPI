@@ -20,8 +20,7 @@ const (
 )
 
 var modelsURLs = []string{
-	"https://raw.githubusercontent.com/router-for-me/models/refs/heads/main/models.json",
-	"https://models.router-for.me/models.json",
+	// Remote model fetching disabled for security — only the embedded models.json is used.
 }
 
 //go:embed models/models.json

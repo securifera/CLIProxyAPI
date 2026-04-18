@@ -6,13 +6,11 @@ package api
 
 import (
 	"context"
-	"crypto/subtle"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,18 +20,15 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/access"
 	managementHandlers "github.com/router-for-me/CLIProxyAPI/v6/internal/api/handlers/management"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api/middleware"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/api/modules"
-	ampmodule "github.com/router-for-me/CLIProxyAPI/v6/internal/api/modules/amp"
+
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementasset"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers/claude"
-	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers/gemini"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers/openai"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -49,9 +44,6 @@ type serverOptionConfig struct {
 	routerConfigurator   func(*gin.Engine, *handlers.BaseAPIHandler, *config.Config)
 	requestLoggerFactory func(*config.Config, string) logging.RequestLogger
 	localPassword        string
-	keepAliveEnabled     bool
-	keepAliveTimeout     time.Duration
-	keepAliveOnTimeout   func()
 	postAuthHook         auth.PostAuthHook
 }
 
@@ -89,18 +81,6 @@ func WithRouterConfigurator(fn func(*gin.Engine, *handlers.BaseAPIHandler, *conf
 func WithLocalManagementPassword(password string) ServerOption {
 	return func(cfg *serverOptionConfig) {
 		cfg.localPassword = password
-	}
-}
-
-// WithKeepAliveEndpoint enables a keep-alive endpoint with the provided timeout and callback.
-func WithKeepAliveEndpoint(timeout time.Duration, onTimeout func()) ServerOption {
-	return func(cfg *serverOptionConfig) {
-		if timeout <= 0 || onTimeout == nil {
-			return
-		}
-		cfg.keepAliveEnabled = true
-		cfg.keepAliveTimeout = timeout
-		cfg.keepAliveOnTimeout = onTimeout
 	}
 }
 
@@ -159,9 +139,6 @@ type Server struct {
 	// management handler
 	mgmt *managementHandlers.Handler
 
-	// ampModule is the Amp routing module for model mapping hot-reload
-	ampModule *ampmodule.AmpModule
-
 	// managementRoutesRegistered tracks whether the management routes have been attached to the engine.
 	managementRoutesRegistered atomic.Bool
 	// managementRoutesEnabled controls whether management endpoints serve real handlers.
@@ -171,12 +148,6 @@ type Server struct {
 	envManagementSecret bool
 
 	localPassword string
-
-	keepAliveEnabled   bool
-	keepAliveTimeout   time.Duration
-	keepAliveOnTimeout func()
-	keepAliveHeartbeat chan struct{}
-	keepAliveStop      chan struct{}
 }
 
 // NewServer creates and initializes a new API server instance.
@@ -260,7 +231,6 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	if authManager != nil {
 		authManager.SetRetryConfig(cfg.RequestRetry, time.Duration(cfg.MaxRetryInterval)*time.Second, cfg.MaxRetryCredentials)
 	}
-	managementasset.SetCurrentConfig(cfg)
 	auth.SetQuotaCooldownDisabled(cfg.DisableCooling)
 	applySignatureCacheConfig(nil, cfg)
 	// Initialize management handler
@@ -278,35 +248,6 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	// Setup routes
 	s.setupRoutes()
 
-	// Register Amp module using V2 interface with Context
-	s.ampModule = ampmodule.NewLegacy(accessManager, AuthMiddleware(accessManager))
-	ctx := modules.Context{
-		Engine:         engine,
-		BaseHandler:    s.handlers,
-		Config:         cfg,
-		AuthMiddleware: AuthMiddleware(accessManager),
-	}
-	if err := modules.RegisterModule(ctx, s.ampModule); err != nil {
-		log.Errorf("Failed to register Amp module: %v", err)
-	}
-
-	// Apply additional router configurators from options
-	if optionState.routerConfigurator != nil {
-		optionState.routerConfigurator(engine, s.handlers, cfg)
-	}
-
-	// Register management routes when configuration or environment secrets are available,
-	// or when a local management password is provided (e.g. TUI mode).
-	hasManagementSecret := cfg.RemoteManagement.SecretKey != "" || envManagementSecret || s.localPassword != ""
-	s.managementRoutesEnabled.Store(hasManagementSecret)
-	if hasManagementSecret {
-		s.registerManagementRoutes()
-	}
-
-	if optionState.keepAliveEnabled {
-		s.enableKeepAlive(optionState.keepAliveTimeout, optionState.keepAliveOnTimeout)
-	}
-
 	// Create HTTP server
 	s.server = &http.Server{
 		Addr:    fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
@@ -323,10 +264,7 @@ func (s *Server) setupRoutes() {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
 
-	s.engine.GET("/management.html", s.serveManagementControlPanel)
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
-	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)
-	geminiCLIHandlers := gemini.NewGeminiCLIAPIHandler(s.handlers)
 	claudeCodeHandlers := claude.NewClaudeCodeAPIHandler(s.handlers)
 	openaiResponsesHandlers := openai.NewOpenAIResponsesAPIHandler(s.handlers)
 
@@ -344,27 +282,7 @@ func (s *Server) setupRoutes() {
 		v1.POST("/responses/compact", openaiResponsesHandlers.Compact)
 	}
 
-	// Gemini compatible API routes
-	v1beta := s.engine.Group("/v1beta")
-	v1beta.Use(AuthMiddleware(s.accessManager))
-	{
-		v1beta.GET("/models", geminiHandlers.GeminiModels)
-		v1beta.POST("/models/*action", geminiHandlers.GeminiHandler)
-		v1beta.GET("/models/*action", geminiHandlers.GeminiGetHandler)
-	}
 
-	// Root endpoint
-	s.engine.GET("/", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{
-			"message": "CLI Proxy API Server",
-			"endpoints": []string{
-				"POST /v1/chat/completions",
-				"POST /v1/completions",
-				"GET /v1/models",
-			},
-		})
-	})
-	s.engine.POST("/v1internal:method", geminiCLIHandlers.CLIHandler)
 
 	// OAuth callback endpoints (reuse main server port)
 	// These endpoints receive provider redirects and persist
@@ -465,291 +383,6 @@ func (s *Server) AttachWebsocketRoute(path string, handler http.Handler) {
 	s.engine.GET(trimmed, conditionalAuth, finalHandler)
 }
 
-func (s *Server) registerManagementRoutes() {
-	if s == nil || s.engine == nil || s.mgmt == nil {
-		return
-	}
-	if !s.managementRoutesRegistered.CompareAndSwap(false, true) {
-		return
-	}
-
-	log.Info("management routes registered after secret key configuration")
-
-	mgmt := s.engine.Group("/v0/management")
-	mgmt.Use(s.managementAvailabilityMiddleware(), s.mgmt.Middleware())
-	{
-		mgmt.GET("/usage", s.mgmt.GetUsageStatistics)
-		mgmt.GET("/usage/export", s.mgmt.ExportUsageStatistics)
-		mgmt.POST("/usage/import", s.mgmt.ImportUsageStatistics)
-		mgmt.GET("/config", s.mgmt.GetConfig)
-		mgmt.GET("/config.yaml", s.mgmt.GetConfigYAML)
-		mgmt.PUT("/config.yaml", s.mgmt.PutConfigYAML)
-		mgmt.GET("/latest-version", s.mgmt.GetLatestVersion)
-
-		mgmt.GET("/debug", s.mgmt.GetDebug)
-		mgmt.PUT("/debug", s.mgmt.PutDebug)
-		mgmt.PATCH("/debug", s.mgmt.PutDebug)
-
-		mgmt.GET("/logging-to-file", s.mgmt.GetLoggingToFile)
-		mgmt.PUT("/logging-to-file", s.mgmt.PutLoggingToFile)
-		mgmt.PATCH("/logging-to-file", s.mgmt.PutLoggingToFile)
-
-		mgmt.GET("/logs-max-total-size-mb", s.mgmt.GetLogsMaxTotalSizeMB)
-		mgmt.PUT("/logs-max-total-size-mb", s.mgmt.PutLogsMaxTotalSizeMB)
-		mgmt.PATCH("/logs-max-total-size-mb", s.mgmt.PutLogsMaxTotalSizeMB)
-
-		mgmt.GET("/error-logs-max-files", s.mgmt.GetErrorLogsMaxFiles)
-		mgmt.PUT("/error-logs-max-files", s.mgmt.PutErrorLogsMaxFiles)
-		mgmt.PATCH("/error-logs-max-files", s.mgmt.PutErrorLogsMaxFiles)
-
-		mgmt.GET("/usage-statistics-enabled", s.mgmt.GetUsageStatisticsEnabled)
-		mgmt.PUT("/usage-statistics-enabled", s.mgmt.PutUsageStatisticsEnabled)
-		mgmt.PATCH("/usage-statistics-enabled", s.mgmt.PutUsageStatisticsEnabled)
-
-		mgmt.GET("/proxy-url", s.mgmt.GetProxyURL)
-		mgmt.PUT("/proxy-url", s.mgmt.PutProxyURL)
-		mgmt.PATCH("/proxy-url", s.mgmt.PutProxyURL)
-		mgmt.DELETE("/proxy-url", s.mgmt.DeleteProxyURL)
-
-		mgmt.POST("/api-call", s.mgmt.APICall)
-
-		mgmt.GET("/quota-exceeded/switch-project", s.mgmt.GetSwitchProject)
-		mgmt.PUT("/quota-exceeded/switch-project", s.mgmt.PutSwitchProject)
-		mgmt.PATCH("/quota-exceeded/switch-project", s.mgmt.PutSwitchProject)
-
-		mgmt.GET("/quota-exceeded/switch-preview-model", s.mgmt.GetSwitchPreviewModel)
-		mgmt.PUT("/quota-exceeded/switch-preview-model", s.mgmt.PutSwitchPreviewModel)
-		mgmt.PATCH("/quota-exceeded/switch-preview-model", s.mgmt.PutSwitchPreviewModel)
-
-		mgmt.GET("/api-keys", s.mgmt.GetAPIKeys)
-		mgmt.PUT("/api-keys", s.mgmt.PutAPIKeys)
-		mgmt.PATCH("/api-keys", s.mgmt.PatchAPIKeys)
-		mgmt.DELETE("/api-keys", s.mgmt.DeleteAPIKeys)
-
-		mgmt.GET("/gemini-api-key", s.mgmt.GetGeminiKeys)
-		mgmt.PUT("/gemini-api-key", s.mgmt.PutGeminiKeys)
-		mgmt.PATCH("/gemini-api-key", s.mgmt.PatchGeminiKey)
-		mgmt.DELETE("/gemini-api-key", s.mgmt.DeleteGeminiKey)
-
-		mgmt.GET("/logs", s.mgmt.GetLogs)
-		mgmt.DELETE("/logs", s.mgmt.DeleteLogs)
-		mgmt.GET("/request-error-logs", s.mgmt.GetRequestErrorLogs)
-		mgmt.GET("/request-error-logs/:name", s.mgmt.DownloadRequestErrorLog)
-		mgmt.GET("/request-log-by-id/:id", s.mgmt.GetRequestLogByID)
-		mgmt.GET("/request-log", s.mgmt.GetRequestLog)
-		mgmt.PUT("/request-log", s.mgmt.PutRequestLog)
-		mgmt.PATCH("/request-log", s.mgmt.PutRequestLog)
-		mgmt.GET("/ws-auth", s.mgmt.GetWebsocketAuth)
-		mgmt.PUT("/ws-auth", s.mgmt.PutWebsocketAuth)
-		mgmt.PATCH("/ws-auth", s.mgmt.PutWebsocketAuth)
-
-		mgmt.GET("/ampcode", s.mgmt.GetAmpCode)
-		mgmt.GET("/ampcode/upstream-url", s.mgmt.GetAmpUpstreamURL)
-		mgmt.PUT("/ampcode/upstream-url", s.mgmt.PutAmpUpstreamURL)
-		mgmt.PATCH("/ampcode/upstream-url", s.mgmt.PutAmpUpstreamURL)
-		mgmt.DELETE("/ampcode/upstream-url", s.mgmt.DeleteAmpUpstreamURL)
-		mgmt.GET("/ampcode/upstream-api-key", s.mgmt.GetAmpUpstreamAPIKey)
-		mgmt.PUT("/ampcode/upstream-api-key", s.mgmt.PutAmpUpstreamAPIKey)
-		mgmt.PATCH("/ampcode/upstream-api-key", s.mgmt.PutAmpUpstreamAPIKey)
-		mgmt.DELETE("/ampcode/upstream-api-key", s.mgmt.DeleteAmpUpstreamAPIKey)
-		mgmt.GET("/ampcode/restrict-management-to-localhost", s.mgmt.GetAmpRestrictManagementToLocalhost)
-		mgmt.PUT("/ampcode/restrict-management-to-localhost", s.mgmt.PutAmpRestrictManagementToLocalhost)
-		mgmt.PATCH("/ampcode/restrict-management-to-localhost", s.mgmt.PutAmpRestrictManagementToLocalhost)
-		mgmt.GET("/ampcode/model-mappings", s.mgmt.GetAmpModelMappings)
-		mgmt.PUT("/ampcode/model-mappings", s.mgmt.PutAmpModelMappings)
-		mgmt.PATCH("/ampcode/model-mappings", s.mgmt.PatchAmpModelMappings)
-		mgmt.DELETE("/ampcode/model-mappings", s.mgmt.DeleteAmpModelMappings)
-		mgmt.GET("/ampcode/force-model-mappings", s.mgmt.GetAmpForceModelMappings)
-		mgmt.PUT("/ampcode/force-model-mappings", s.mgmt.PutAmpForceModelMappings)
-		mgmt.PATCH("/ampcode/force-model-mappings", s.mgmt.PutAmpForceModelMappings)
-		mgmt.GET("/ampcode/upstream-api-keys", s.mgmt.GetAmpUpstreamAPIKeys)
-		mgmt.PUT("/ampcode/upstream-api-keys", s.mgmt.PutAmpUpstreamAPIKeys)
-		mgmt.PATCH("/ampcode/upstream-api-keys", s.mgmt.PatchAmpUpstreamAPIKeys)
-		mgmt.DELETE("/ampcode/upstream-api-keys", s.mgmt.DeleteAmpUpstreamAPIKeys)
-
-		mgmt.GET("/request-retry", s.mgmt.GetRequestRetry)
-		mgmt.PUT("/request-retry", s.mgmt.PutRequestRetry)
-		mgmt.PATCH("/request-retry", s.mgmt.PutRequestRetry)
-		mgmt.GET("/max-retry-interval", s.mgmt.GetMaxRetryInterval)
-		mgmt.PUT("/max-retry-interval", s.mgmt.PutMaxRetryInterval)
-		mgmt.PATCH("/max-retry-interval", s.mgmt.PutMaxRetryInterval)
-
-		mgmt.GET("/force-model-prefix", s.mgmt.GetForceModelPrefix)
-		mgmt.PUT("/force-model-prefix", s.mgmt.PutForceModelPrefix)
-		mgmt.PATCH("/force-model-prefix", s.mgmt.PutForceModelPrefix)
-
-		mgmt.GET("/routing/strategy", s.mgmt.GetRoutingStrategy)
-		mgmt.PUT("/routing/strategy", s.mgmt.PutRoutingStrategy)
-		mgmt.PATCH("/routing/strategy", s.mgmt.PutRoutingStrategy)
-
-		mgmt.GET("/claude-api-key", s.mgmt.GetClaudeKeys)
-		mgmt.PUT("/claude-api-key", s.mgmt.PutClaudeKeys)
-		mgmt.PATCH("/claude-api-key", s.mgmt.PatchClaudeKey)
-		mgmt.DELETE("/claude-api-key", s.mgmt.DeleteClaudeKey)
-
-		mgmt.GET("/codex-api-key", s.mgmt.GetCodexKeys)
-		mgmt.PUT("/codex-api-key", s.mgmt.PutCodexKeys)
-		mgmt.PATCH("/codex-api-key", s.mgmt.PatchCodexKey)
-		mgmt.DELETE("/codex-api-key", s.mgmt.DeleteCodexKey)
-
-		mgmt.GET("/openai-compatibility", s.mgmt.GetOpenAICompat)
-		mgmt.PUT("/openai-compatibility", s.mgmt.PutOpenAICompat)
-		mgmt.PATCH("/openai-compatibility", s.mgmt.PatchOpenAICompat)
-		mgmt.DELETE("/openai-compatibility", s.mgmt.DeleteOpenAICompat)
-
-		mgmt.GET("/vertex-api-key", s.mgmt.GetVertexCompatKeys)
-		mgmt.PUT("/vertex-api-key", s.mgmt.PutVertexCompatKeys)
-		mgmt.PATCH("/vertex-api-key", s.mgmt.PatchVertexCompatKey)
-		mgmt.DELETE("/vertex-api-key", s.mgmt.DeleteVertexCompatKey)
-
-		mgmt.GET("/oauth-excluded-models", s.mgmt.GetOAuthExcludedModels)
-		mgmt.PUT("/oauth-excluded-models", s.mgmt.PutOAuthExcludedModels)
-		mgmt.PATCH("/oauth-excluded-models", s.mgmt.PatchOAuthExcludedModels)
-		mgmt.DELETE("/oauth-excluded-models", s.mgmt.DeleteOAuthExcludedModels)
-
-		mgmt.GET("/oauth-model-alias", s.mgmt.GetOAuthModelAlias)
-		mgmt.PUT("/oauth-model-alias", s.mgmt.PutOAuthModelAlias)
-		mgmt.PATCH("/oauth-model-alias", s.mgmt.PatchOAuthModelAlias)
-		mgmt.DELETE("/oauth-model-alias", s.mgmt.DeleteOAuthModelAlias)
-
-		mgmt.GET("/auth-files", s.mgmt.ListAuthFiles)
-		mgmt.GET("/auth-files/models", s.mgmt.GetAuthFileModels)
-		mgmt.GET("/model-definitions/:channel", s.mgmt.GetStaticModelDefinitions)
-		mgmt.GET("/auth-files/download", s.mgmt.DownloadAuthFile)
-		mgmt.POST("/auth-files", s.mgmt.UploadAuthFile)
-		mgmt.DELETE("/auth-files", s.mgmt.DeleteAuthFile)
-		mgmt.PATCH("/auth-files/status", s.mgmt.PatchAuthFileStatus)
-		mgmt.PATCH("/auth-files/fields", s.mgmt.PatchAuthFileFields)
-		mgmt.POST("/vertex/import", s.mgmt.ImportVertexCredential)
-
-		mgmt.GET("/anthropic-auth-url", s.mgmt.RequestAnthropicToken)
-		mgmt.GET("/codex-auth-url", s.mgmt.RequestCodexToken)
-		mgmt.GET("/gemini-cli-auth-url", s.mgmt.RequestGeminiCLIToken)
-		mgmt.GET("/antigravity-auth-url", s.mgmt.RequestAntigravityToken)
-		mgmt.GET("/kimi-auth-url", s.mgmt.RequestKimiToken)
-		mgmt.POST("/oauth-callback", s.mgmt.PostOAuthCallback)
-		mgmt.GET("/get-auth-status", s.mgmt.GetAuthStatus)
-	}
-}
-
-func (s *Server) managementAvailabilityMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		if !s.managementRoutesEnabled.Load() {
-			c.AbortWithStatus(http.StatusNotFound)
-			return
-		}
-		c.Next()
-	}
-}
-
-func (s *Server) serveManagementControlPanel(c *gin.Context) {
-	cfg := s.cfg
-	if cfg == nil || cfg.RemoteManagement.DisableControlPanel {
-		c.AbortWithStatus(http.StatusNotFound)
-		return
-	}
-	filePath := managementasset.FilePath(s.configFilePath)
-	if strings.TrimSpace(filePath) == "" {
-		c.AbortWithStatus(http.StatusNotFound)
-		return
-	}
-
-	if _, err := os.Stat(filePath); err != nil {
-		if os.IsNotExist(err) {
-			// Synchronously ensure management.html is available with a detached context.
-			// Control panel bootstrap should not be canceled by client disconnects.
-			if !managementasset.EnsureLatestManagementHTML(context.Background(), managementasset.StaticDir(s.configFilePath), cfg.ProxyURL, cfg.RemoteManagement.PanelGitHubRepository) {
-				c.AbortWithStatus(http.StatusNotFound)
-				return
-			}
-		} else {
-			log.WithError(err).Error("failed to stat management control panel asset")
-			c.AbortWithStatus(http.StatusInternalServerError)
-			return
-		}
-	}
-
-	c.File(filePath)
-}
-
-func (s *Server) enableKeepAlive(timeout time.Duration, onTimeout func()) {
-	if timeout <= 0 || onTimeout == nil {
-		return
-	}
-
-	s.keepAliveEnabled = true
-	s.keepAliveTimeout = timeout
-	s.keepAliveOnTimeout = onTimeout
-	s.keepAliveHeartbeat = make(chan struct{}, 1)
-	s.keepAliveStop = make(chan struct{}, 1)
-
-	s.engine.GET("/keep-alive", s.handleKeepAlive)
-
-	go s.watchKeepAlive()
-}
-
-func (s *Server) handleKeepAlive(c *gin.Context) {
-	if s.localPassword != "" {
-		provided := strings.TrimSpace(c.GetHeader("Authorization"))
-		if provided != "" {
-			parts := strings.SplitN(provided, " ", 2)
-			if len(parts) == 2 && strings.EqualFold(parts[0], "bearer") {
-				provided = parts[1]
-			}
-		}
-		if provided == "" {
-			provided = strings.TrimSpace(c.GetHeader("X-Local-Password"))
-		}
-		if subtle.ConstantTimeCompare([]byte(provided), []byte(s.localPassword)) != 1 {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid password"})
-			return
-		}
-	}
-
-	s.signalKeepAlive()
-	c.JSON(http.StatusOK, gin.H{"status": "ok"})
-}
-
-func (s *Server) signalKeepAlive() {
-	if !s.keepAliveEnabled {
-		return
-	}
-	select {
-	case s.keepAliveHeartbeat <- struct{}{}:
-	default:
-	}
-}
-
-func (s *Server) watchKeepAlive() {
-	if !s.keepAliveEnabled {
-		return
-	}
-
-	timer := time.NewTimer(s.keepAliveTimeout)
-	defer timer.Stop()
-
-	for {
-		select {
-		case <-timer.C:
-			log.Warnf("keep-alive endpoint idle for %s, shutting down", s.keepAliveTimeout)
-			if s.keepAliveOnTimeout != nil {
-				s.keepAliveOnTimeout()
-			}
-			return
-		case <-s.keepAliveHeartbeat:
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			timer.Reset(s.keepAliveTimeout)
-		case <-s.keepAliveStop:
-			return
-		}
-	}
-}
-
 // unifiedModelsHandler creates a unified handler for the /v1/models endpoint
 // that routes to different handlers based on the User-Agent header.
 // If User-Agent starts with "claude-cli", it routes to Claude handler,
@@ -811,13 +444,6 @@ func (s *Server) Start() error {
 //   - error: An error if the server fails to stop
 func (s *Server) Stop(ctx context.Context) error {
 	log.Debug("Stopping API server...")
-
-	if s.keepAliveEnabled {
-		select {
-		case s.keepAliveStop <- struct{}{}:
-		default:
-		}
-	}
 
 	// Shutdown the HTTP server.
 	if err := s.server.Shutdown(ctx); err != nil {
@@ -914,45 +540,12 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 		util.SetLogLevel(cfg)
 	}
 
-	prevSecretEmpty := true
-	if oldCfg != nil {
-		prevSecretEmpty = oldCfg.RemoteManagement.SecretKey == ""
-	}
-	newSecretEmpty := cfg.RemoteManagement.SecretKey == ""
-	if s.envManagementSecret {
-		s.registerManagementRoutes()
-		if s.managementRoutesEnabled.CompareAndSwap(false, true) {
-			log.Info("management routes enabled via MANAGEMENT_PASSWORD")
-		} else {
-			s.managementRoutesEnabled.Store(true)
-		}
-	} else {
-		switch {
-		case prevSecretEmpty && !newSecretEmpty:
-			s.registerManagementRoutes()
-			if s.managementRoutesEnabled.CompareAndSwap(false, true) {
-				log.Info("management routes enabled after secret key update")
-			} else {
-				s.managementRoutesEnabled.Store(true)
-			}
-		case !prevSecretEmpty && newSecretEmpty:
-			if s.managementRoutesEnabled.CompareAndSwap(true, false) {
-				log.Info("management routes disabled after secret key removal")
-			} else {
-				s.managementRoutesEnabled.Store(false)
-			}
-		default:
-			s.managementRoutesEnabled.Store(!newSecretEmpty)
-		}
-	}
-
 	s.applyAccessConfig(oldCfg, cfg)
 	s.cfg = cfg
 	s.wsAuthEnabled.Store(cfg.WebsocketAuth)
 	if oldCfg != nil && s.wsAuthChanged != nil && oldCfg.WebsocketAuth != cfg.WebsocketAuth {
 		s.wsAuthChanged(oldCfg.WebsocketAuth, cfg.WebsocketAuth)
 	}
-	managementasset.SetCurrentConfig(cfg)
 	// Save YAML snapshot for next comparison
 	s.oldConfigYaml, _ = yaml.Marshal(cfg)
 
@@ -961,19 +554,6 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 	if s.mgmt != nil {
 		s.mgmt.SetConfig(cfg)
 		s.mgmt.SetAuthManager(s.handlers.AuthManager)
-	}
-
-	// Notify Amp module only when Amp config has changed.
-	ampConfigChanged := oldCfg == nil || !reflect.DeepEqual(oldCfg.AmpCode, cfg.AmpCode)
-	if ampConfigChanged {
-		if s.ampModule != nil {
-			log.Debugf("triggering amp module config update")
-			if err := s.ampModule.OnConfigUpdated(cfg); err != nil {
-				log.Errorf("failed to update Amp module config: %v", err)
-			}
-		} else {
-			log.Warnf("amp module is nil, skipping config update")
-		}
 	}
 
 	// Count client sources from configuration and auth store.

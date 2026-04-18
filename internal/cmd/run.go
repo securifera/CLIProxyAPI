@@ -8,9 +8,7 @@ import (
 	"errors"
 	"os/signal"
 	"syscall"
-	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy"
 	log "github.com/sirupsen/logrus"
@@ -34,14 +32,6 @@ func StartService(cfg *config.Config, configPath string, localPassword string) {
 	defer cancel()
 
 	runCtx := ctxSignal
-	if localPassword != "" {
-		var keepAliveCancel context.CancelFunc
-		runCtx, keepAliveCancel = context.WithCancel(ctxSignal)
-		builder = builder.WithServerOptions(api.WithKeepAliveEndpoint(10*time.Second, func() {
-			log.Warn("keep-alive endpoint idle for 10s, shutting down")
-			keepAliveCancel()
-		}))
-	}
 
 	service, err := builder.Build()
 	if err != nil {

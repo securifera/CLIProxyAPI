@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -284,6 +285,24 @@ func (s *Server) setupRoutes() {
 
 
 
+	// Headless OAuth setup endpoints — for initiating auth flows from a remote browser.
+	// Protected by the same API-key AuthMiddleware as /v1/*.
+	//
+	// Flow:
+	//   1. GET /auth/{provider}-url  → returns {"url":"...","state":"..."}, starts exchange goroutine
+	//   2. Admin opens URL in browser; provider redirects to localhost:PORT?code=X&state=Y
+	//   3. Admin copies the failed redirect URL, POSTs it to /auth/callback-relay
+	//   4. GET /auth/status?state=Y  → poll until {"status":"ok"} or {"status":"error"}
+	authSetup := s.engine.Group("/auth")
+	authSetup.Use(AuthMiddleware(s.accessManager))
+	{
+		authSetup.GET("/anthropic-url", s.mgmt.RequestAnthropicToken)
+		authSetup.GET("/codex-url", s.mgmt.RequestCodexToken)
+		authSetup.GET("/gemini-url", s.mgmt.RequestGeminiCLIToken)
+		authSetup.GET("/status", s.mgmt.GetAuthStatus)
+		authSetup.POST("/callback-relay", s.handleAuthCallbackRelay)
+	}
+
 	// OAuth callback endpoints (reuse main server port)
 	// These endpoints receive provider redirects and persist
 	// the short-lived code/state for the waiting goroutine.
@@ -400,6 +419,69 @@ func (s *Server) unifiedModelsHandler(openaiHandler *openai.OpenAIAPIHandler, cl
 			openaiHandler.OpenAIModels(c)
 		}
 	}
+}
+
+// handleAuthCallbackRelay accepts the full redirect URL that the provider sent to localhost
+// (which failed in the admin's browser) and feeds the code+state into the waiting exchange
+// goroutine started by /auth/{provider}-url.
+//
+// Request body (JSON):
+//
+//	{"url": "http://localhost:54545?code=xxx&state=yyy"}
+//
+// The provider is inferred from the registered pending OAuth session keyed by state.
+func (s *Server) handleAuthCallbackRelay(c *gin.Context) {
+	var body struct {
+		URL string `json:"url"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || strings.TrimSpace(body.URL) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing url in request body"})
+		return
+	}
+
+	parsed, err := url.Parse(body.URL)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid url"})
+		return
+	}
+
+	code := strings.TrimSpace(parsed.Query().Get("code"))
+	state := strings.TrimSpace(parsed.Query().Get("state"))
+	errStr := strings.TrimSpace(parsed.Query().Get("error"))
+	if errStr == "" {
+		errStr = strings.TrimSpace(parsed.Query().Get("error_description"))
+	}
+
+	if state == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "state parameter missing from url"})
+		return
+	}
+	if code == "" && errStr == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "code parameter missing from url"})
+		return
+	}
+
+	// Infer provider from the pending session registered when the URL was generated.
+	provider, _, ok := managementHandlers.GetOAuthSession(state)
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "no pending auth session found for this state; did it expire or was the URL already submitted?"})
+		return
+	}
+
+	if s.cfg == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "server not configured"})
+		return
+	}
+
+	_, writeErr := managementHandlers.WriteOAuthCallbackFileForPendingSession(
+		s.cfg.AuthDir, provider, state, code, errStr,
+	)
+	if writeErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": writeErr.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "state": state, "provider": provider})
 }
 
 // Start begins listening for and serving HTTP or HTTPS requests.
